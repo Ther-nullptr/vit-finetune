@@ -27,6 +27,7 @@ class MyLightningCLI(LightningCLI):
             }
         )
         parser.link_arguments("data.size", "model.image_size")
+        parser.link_arguments("data.batch_size", "model.batch_size")
         parser.link_arguments(
             "data.num_classes", "model.n_classes", apply_on="instantiate"
         )

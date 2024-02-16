@@ -4,13 +4,15 @@ import pandas as pd
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+import lpmm
+import wandb
 from peft import LoraConfig, get_peft_model
 from torch.optim import SGD, Adam, AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torchmetrics import MetricCollection
 from torchmetrics.classification.accuracy import Accuracy
 from torchmetrics.classification.stat_scores import StatScores
-from transformers import AutoConfig, AutoModelForImageClassification
+from transformers import AutoConfig, AutoModelForImageClassification, BitsAndBytesConfig
 from transformers.optimization import get_cosine_schedule_with_warmup
 
 from src.loss import SoftTargetCrossEntropy
@@ -62,6 +64,11 @@ class ClassificationModel(pl.LightningModule):
         lora_dropout: float = 0.0,
         lora_bias: str = "none",
         from_scratch: bool = False,
+        batch_size: int = 32,
+        filename: str = "none",
+        open_gact: bool = False,
+        gact_level: str = "L0",
+        use_4bit: bool = False,
     ):
         """Classification Model
 
@@ -89,6 +96,10 @@ class ClassificationModel(pl.LightningModule):
             lora_dropout: Dropout probability for LoRA layers
             lora_bias: Whether to train biases during LoRA. One of ['none', 'all' or 'lora_only']
             from_scratch: Initialize network with random weights instead of a pretrained checkpoint
+            batch_size: Batch size
+            filename: Name of the checkpoint file & wandb run name
+            open_gact: Whether to use GACT
+            gact_level: GACT level. One of ['L0', 'L1', 'L1.2', 'L2.2']
         """
         super().__init__()
         self.save_hyperparameters()
@@ -114,6 +125,11 @@ class ClassificationModel(pl.LightningModule):
         self.lora_dropout = lora_dropout
         self.lora_bias = lora_bias
         self.from_scratch = from_scratch
+        self.batch_size = batch_size
+        self.filename = filename
+        self.open_gact = open_gact
+        self.gact_level = gact_level
+        self.use_4bit = use_4bit
 
         # Initialize network
         try:
@@ -131,12 +147,28 @@ class ClassificationModel(pl.LightningModule):
             self.net.classifier = torch.nn.Linear(config.hidden_size, self.n_classes)
         else:
             # Initialize with pretrained weights
-            self.net = AutoModelForImageClassification.from_pretrained(
-                model_path,
-                num_labels=self.n_classes,
-                ignore_mismatched_sizes=True,
-                image_size=self.image_size,
-            )
+            if self.use_4bit:
+                assert self.training_mode != "full", "4-bit quantization can not work with full fine-tuning mode"
+                self.net = AutoModelForImageClassification.from_pretrained(
+                    model_path,
+                    num_labels=self.n_classes,
+                    ignore_mismatched_sizes=True,
+                    image_size=self.image_size,
+                    quantization_config=BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
+                        llm_int8_skip_modules=["classifier"],
+                    ),
+                )
+            else:
+                self.net = AutoModelForImageClassification.from_pretrained(
+                    model_path,
+                    num_labels=self.n_classes,
+                    ignore_mismatched_sizes=True,
+                    image_size=self.image_size,
+                )
+
+        print(self.net)
 
         # Load checkpoint weights
         if self.weights:
@@ -224,12 +256,43 @@ class ClassificationModel(pl.LightningModule):
         )
 
         self.test_metric_outputs = []
+        
+        # Define wandb logger
+        wandb.init(
+            project=f"{self.model_name}_{self.training_mode}",
+            name=f"lr_{self.lr}_bs_{self.batch_size}_optim_{self.optimizer}_scheduler_{self.scheduler}_gact_{self.gact_level}_4bit_{self.use_4bit}",
+        )
+        self.train_step = 0
+        self.val_step = 0
+        wandb.define_metric("train_step")
+        wandb.define_metric("val_step")
+        # set all other train/ metrics to use this step
+        wandb.define_metric("train_*", step_metric="train_step")
+        wandb.define_metric("val_*", step_metric="val_step")
+
+        # Enable GACT
+        if self.open_gact:
+            import gact
+            from gact.controller import Controller
+            gact.set_optimization_level(self.gact_level) # set optmization level, more config info can be seen in gact/conf.py
+            self.controller = Controller(self.net)
+            self.controller.install_hook()
+            print("GACT is enabled")
 
     def forward(self, x):
         return self.net(pixel_values=x).logits
+    
+    def gact_backward(self):
+        optimizer_tmp = self.optimizers()
+        partial_pred = self(self.partial_x)
+        loss = self.loss_fn(partial_pred, self.partial_y)
+        self.optimizer_zero_grad(self.current_epoch, 0, optimizer_tmp)
+        self.backward(loss)
 
     def shared_step(self, batch, mode="train"):
         x, y = batch
+        self.train_step += 1 if mode == "train" else 0
+        self.val_step += 1 if mode == "val" else 0
 
         if mode == "train":
             # Only converts targets to one-hot if no label smoothing, mixup or cutmix is set
@@ -237,18 +300,33 @@ class ClassificationModel(pl.LightningModule):
         else:
             y = F.one_hot(y, num_classes=self.n_classes).float()
 
+        #! iterate the last step of gact
+        if self.open_gact and mode == "train" and self.train_step != 1:
+            self.controller.iterate(self.gact_backward)
+
         # Pass through network
         pred = self(x)
         loss = self.loss_fn(pred, y)
+
+        # only for GACT
+        if self.open_gact:
+            self.partial_x = x[:8]
+            self.partial_y = y[:8]
+        
+        # optimizer step
+        # iterate the controller
 
         # Get accuracy
         metrics = getattr(self, f"{mode}_metrics")(pred, y.argmax(1))
 
         # Log
         self.log(f"{mode}_loss", loss, on_epoch=True)
+        wandb.log({f"{mode}_loss": loss, f"{mode}_step": self.train_step if mode == "train" else self.val_step})
+        
         for k, v in metrics.items():
             if len(v.size()) == 0:
                 self.log(f"{mode}_{k.lower()}", v, on_epoch=True)
+                wandb.log({f"{mode}_{k.lower()}": v, f"{mode}_step": self.train_step if mode == "train" else self.val_step})
 
         if mode == "test":
             self.test_metric_outputs.append(metrics["stats"])
@@ -304,6 +382,13 @@ class ClassificationModel(pl.LightningModule):
                 self.net.parameters(),
                 lr=self.lr,
                 momentum=self.momentum,
+                weight_decay=self.weight_decay,
+            )
+        elif self.optimizer == "adamw4bit":
+            optimizer = lpmm.optim.AdamW(
+                self.net.parameters(),
+                lr=self.lr,
+                betas=self.betas,
                 weight_decay=self.weight_decay,
             )
         else:

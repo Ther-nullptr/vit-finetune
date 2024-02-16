@@ -13,12 +13,15 @@ trainer:
 model:
   model_name: vit-b16-224-in21k
   training_mode: full
-  optimizer: sgd
-  lr: 0.01
+  optimizer: adamw
+  lr: 0.00005
   momentum: 0.9
   weight_decay: 0.0
   scheduler: cosine
   warmup_steps: 500
+  use_4bit: false
+  open_gact: true
+  gact_level: L2.2
 data:
   dataset: cifar100
   root: data/
@@ -26,7 +29,7 @@ data:
   batch_size: 128
   workers: 4
 model_checkpoint:
-  filename: best-step-{step}-{val_acc:.4f}
+  filename: best-step-{step}-{val_acc:.4f}-L2.2
   monitor: val_acc
   save_last: true
   mode: max
