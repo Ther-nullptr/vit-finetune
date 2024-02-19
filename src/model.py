@@ -168,8 +168,6 @@ class ClassificationModel(pl.LightningModule):
                     image_size=self.image_size,
                 )
 
-        print(self.net)
-
         # Load checkpoint weights
         if self.weights:
             print(f"Loaded weights from {self.weights}")
@@ -207,6 +205,8 @@ class ClassificationModel(pl.LightningModule):
             raise ValueError(
                 f"{self.training_mode} is not an available fine-tuning mode. Should be one of ['full', 'linear', 'lora']"
             )
+        
+        print(self.net)
 
         # Define metrics
         self.train_metrics = MetricCollection(

@@ -14,7 +14,7 @@ model:
   model_name: vit-b16-224-in21k
   training_mode: lora
   optimizer: adamw
-  lr: 0.005
+  lr: 0.0005
   momentum: 0.9
   weight_decay: 0.0
   scheduler: cosine
@@ -23,7 +23,7 @@ model:
   lora_alpha: 8
   use_4bit: false
   open_gact: true
-  gact_level: L1.2
+  gact_level: L2.2
 data:
   dataset: cifar100
   root: data/
@@ -31,7 +31,7 @@ data:
   batch_size: 128
   workers: 4
 model_checkpoint:
-  filename: best-step-{step}-{val_acc:.4f}-L1.2
+  filename: best-step-{step}-{val_acc:.4f}-L2.2
   monitor: val_acc
   mode: max
   save_last: true
